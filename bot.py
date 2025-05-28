@@ -1,107 +1,248 @@
 import telebot
-import requests
-import urllib.parse
-import os
+import sqlite3
+import threading
+from collections import deque
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))  # Your Telegram user ID
+BOT_TOKEN = "7990422644:AAGfq9wZcbyWlzVP1WDv0HNu5GRruCqAcWs"  # Replace with your bot token
+ADMIN_IDS = [7176592290]  # Replace with your Telegram user ID(s)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-MODELS = ["flux-schnell", "imagen-3-fast", "imagen-3", "recraft-v3"]
-RATIOS = ["1:1", "16:9", "9:16", "3:2", "4:3", "5:4"]
+# Database setup
+conn = sqlite3.connect('botdata.db', check_same_thread=False)
+cursor = conn.cursor()
 
-# Track usage stats
-user_stats = {}
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    blocked INTEGER DEFAULT 0
+)
+''')
 
-@bot.message_handler(commands=['start', 'help'])
-def send_help(message):
-    help_text = (
-        "👋 *Welcome!*\n\n"
-        "Use `/imagen <prompt> <model> <ratio>` to generate images.\n\n"
-        "✅ *Available models:* " + ", ".join(MODELS) + "\n"
-        "✅ *Available ratios:* " + ", ".join(RATIOS) + "\n\n"
-        "📌 *Example:*\n"
-        "`/imagen a beautiful landscape imagen-3 16:9`\n\n"
-        "💡 *Other commands:*\n"
-        "`/stats` → See your usage stats\n"
-        "`/help` → Show this help message"
-    )
-    bot.reply_to(message, help_text, parse_mode="Markdown")
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS chats (
+    user_id INTEGER PRIMARY KEY,
+    partner_id INTEGER
+)
+''')
 
-@bot.message_handler(commands=['imagen'])
-def handle_imagen(message):
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id INTEGER,
+    reported_id INTEGER,
+    reason TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+conn.commit()
+lock = threading.Lock()
+
+waiting_queue = deque()
+
+def is_blocked(user_id):
+    with lock:
+        cursor.execute("SELECT blocked FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+    return row and row[0] == 1
+
+def add_user_if_not_exists(user_id):
+    with lock:
+        cursor.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+        conn.commit()
+
+def set_chat(user1, user2):
+    with lock:
+        cursor.execute("REPLACE INTO chats(user_id, partner_id) VALUES (?, ?)", (user1, user2))
+        cursor.execute("REPLACE INTO chats(user_id, partner_id) VALUES (?, ?)", (user2, user1))
+        conn.commit()
+
+def remove_chat(user_id):
+    with lock:
+        cursor.execute("SELECT partner_id FROM chats WHERE user_id=?", (user_id,))
+        partner = cursor.fetchone()
+        if partner:
+            partner_id = partner[0]
+            cursor.execute("DELETE FROM chats WHERE user_id=?", (user_id,))
+            cursor.execute("DELETE FROM chats WHERE user_id=?", (partner_id,))
+            conn.commit()
+            return partner_id
+        else:
+            return None
+
+def get_partner(user_id):
+    with lock:
+        cursor.execute("SELECT partner_id FROM chats WHERE user_id=?", (user_id,))
+        partner = cursor.fetchone()
+    return partner[0] if partner else None
+
+def find_partner(user_id):
+    if is_blocked(user_id):
+        return None
+    add_user_if_not_exists(user_id)
+    existing_partner = get_partner(user_id)
+    if existing_partner:
+        return existing_partner
+
+    while waiting_queue:
+        partner_id = waiting_queue.popleft()
+        if partner_id != user_id and not is_blocked(partner_id) and get_partner(partner_id) is None:
+            set_chat(user_id, partner_id)
+            return partner_id
+
+    waiting_queue.append(user_id)
+    return None
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
     user_id = message.from_user.id
-    params = message.text[len('/imagen '):].strip()
-    if not params:
-        bot.reply_to(message, "⚠️ Usage: /imagen <prompt> <model> <ratio>")
+    partner = find_partner(user_id)
+    if partner:
+        bot.send_message(user_id, "🤝 Partner found! Say hi anonymously.")
+        bot.send_message(partner, "🤝 Partner found! Say hi anonymously.")
+    else:
+        bot.send_message(user_id, "⏳ Waiting for a partner... Send /stop to cancel.")
+
+@bot.message_handler(commands=['stop'])
+def cmd_stop(message):
+    user_id = message.from_user.id
+    partner = remove_chat(user_id)
+    if partner:
+        bot.send_message(user_id, "🛑 Chat ended.")
+        bot.send_message(partner, "🛑 Your partner ended the chat.")
+    else:
+        if user_id in waiting_queue:
+            try:
+                waiting_queue.remove(user_id)
+            except ValueError:
+                pass
+            bot.send_message(user_id, "❌ You canceled the waiting.")
+        else:
+            bot.send_message(user_id, "ℹ️ You are not in a chat or waiting queue.")
+
+@bot.message_handler(commands=['next'])
+def cmd_next(message):
+    cmd_stop(message)
+    cmd_start(message)
+
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    help_text = """
+Welcome to Anonymous Chat Bot!
+
+Commands:
+/start - Find a partner to chat anonymously
+/stop - End current chat or cancel waiting
+/next - Skip current partner and find new one
+/report <reason> - Report your partner for abuse
+/block - Block your current partner
+/unblock <user_id> - Unblock a user (admin only)
+/stats - Show bot stats (admin only)
+
+Enjoy anonymous chatting! 🤖
+"""
+    bot.send_message(message.chat.id, help_text)
+
+@bot.message_handler(commands=['report'])
+def cmd_report(message):
+    user_id = message.from_user.id
+    partner_id = get_partner(user_id)
+    if not partner_id:
+        bot.send_message(user_id, "ℹ️ You are not chatting with anyone.")
         return
 
-    parts = params.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "❌ Error: Please provide all parameters - prompt, model, and ratio")
+    reason = message.text[len('/report'):].strip()
+    if not reason:
+        bot.send_message(user_id, "❗ Please provide a reason after /report command.")
         return
 
-    prompt = " ".join(parts[:-2])
-    model = parts[-2].lower()
-    ratio = parts[-1]
+    with lock:
+        cursor.execute("INSERT INTO reports (reporter_id, reported_id, reason) VALUES (?, ?, ?)", (user_id, partner_id, reason))
+        conn.commit()
+    bot.send_message(user_id, "✅ Report sent to admin. Thank you!")
 
-    if model not in MODELS:
-        bot.reply_to(message, f"❌ Invalid model! Available: {', '.join(MODELS)}")
+@bot.message_handler(commands=['block'])
+def cmd_block(message):
+    user_id = message.from_user.id
+    partner_id = get_partner(user_id)
+    if not partner_id:
+        bot.send_message(user_id, "ℹ️ You are not chatting with anyone.")
         return
 
-    if ratio not in RATIOS:
-        bot.reply_to(message, f"❌ Invalid ratio! Available: {', '.join(RATIOS)}")
+    with lock:
+        cursor.execute("UPDATE users SET blocked=1 WHERE user_id=?", (partner_id,))
+        conn.commit()
+    remove_chat(user_id)
+    bot.send_message(user_id, "🚫 User blocked and chat ended.")
+    bot.send_message(partner_id, "⚠️ You have been blocked and disconnected.")
+
+@bot.message_handler(commands=['unblock'])
+def cmd_unblock(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ You are not authorized to use this command.")
         return
 
-    # Update user stats
-    user_stats[user_id] = user_stats.get(user_id, 0) + 1
-
-    bot.send_message(message.chat.id, f"🔄 Generating your image...\n"
-                                      f"📝 Prompt: {prompt}\n"
-                                      f"🤖 Model: {model}\n"
-                                      f"📐 Ratio: {ratio}")
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.send_message(message.chat.id, "Usage: /unblock <user_id>")
+        return
 
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        api_url = f"https://img.a3z.workers.dev/?prompt={encoded_prompt}&model={model}&ratio={ratio}"
-        response = requests.get(api_url)
-
-        if response.status_code == 200:
-            bot.send_photo(message.chat.id, api_url,
-                           caption=f"🎨 Generated with: {model}\n📐 Ratio: {ratio}")
-        else:
-            bot.send_message(message.chat.id, f"❌ Error generating image! (Status: {response.status_code})")
-
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
-
-@bot.message_handler(commands=['stats'])
-def handle_stats(message):
-    user_id = message.from_user.id
-    count = user_stats.get(user_id, 0)
-    bot.reply_to(message, f"📊 You have generated *{count}* images using this bot!", parse_mode="Markdown")
-
-@bot.message_handler(commands=['admin'])
-def handle_admin(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ You don't have permission to use this command.")
+        user_to_unblock = int(parts[1])
+    except ValueError:
+        bot.send_message(message.chat.id, "User ID must be a number.")
         return
 
-    total_users = len(user_stats)
-    total_images = sum(user_stats.values())
-    report = f"👑 *Admin Report*\n\n" \
-             f"👥 Total users: {total_users}\n" \
-             f"🖼 Total images generated: {total_images}\n\n"
+    with lock:
+        cursor.execute("UPDATE users SET blocked=0 WHERE user_id=?", (user_to_unblock,))
+        conn.commit()
+    bot.send_message(message.chat.id, f"✅ User {user_to_unblock} unblocked.")
 
-    top_users = sorted(user_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-    report += "🏆 *Top users:*\n"
-    for idx, (uid, count) in enumerate(top_users, 1):
-        report += f"{idx}. User ID {uid}: {count} images\n"
+@bot.message_handler(commands=['stats'])
+def cmd_stats(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ You are not authorized to use this command.")
+        return
 
-    bot.reply_to(message, report, parse_mode="Markdown")
+    with lock:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM chats")
+        total_chats = cursor.fetchone()[0] // 2
+        cursor.execute("SELECT COUNT(*) FROM reports")
+        total_reports = cursor.fetchone()[0]
+
+    bot.send_message(message.chat.id,
+                     f"📊 Bot Stats:\nUsers: {total_users}\nActive chats: {total_chats}\nReports: {total_reports}")
+
+@bot.message_handler(func=lambda m: True)
+def relay(message):
+    user_id = message.from_user.id
+    partner_id = get_partner(user_id)
+    if not partner_id:
+        bot.send_message(user_id, "ℹ️ You are not connected. Use /start to find a partner.")
+        return
+
+    if is_blocked(user_id) or is_blocked(partner_id):
+        bot.send_message(user_id, "⚠️ Chat not available due to block status.")
+        remove_chat(user_id)
+        return
+
+    try:
+        if message.content_type == 'text':
+            bot.send_message(partner_id, message.text)
+        elif message.content_type == 'photo':
+            bot.send_photo(partner_id, message.photo[-1].file_id, caption=message.caption)
+        elif message.content_type == 'sticker':
+            bot.send_sticker(partner_id, message.sticker.file_id)
+        elif message.content_type == 'video':
+            bot.send_video(partner_id, message.video.file_id, caption=message.caption)
+        else:
+            bot.send_message(user_id, "⚠️ Unsupported message type.")
+    except Exception as e:
+        bot.send_message(user_id, "⚠️ Failed to send message to partner.")
 
 if __name__ == "__main__":
-    print("✅ Bot is running...")
+    print("Bot started...")
     bot.infinity_polling()
