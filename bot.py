@@ -3,8 +3,8 @@ import sqlite3
 import threading
 from collections import deque
 
-BOT_TOKEN = "7990422644:AAGfq9wZcbyWlzVP1WDv0HNu5GRruCqAcWs"  # Replace with your bot token
-ADMIN_IDS = [7176592290]  # Replace with your Telegram user ID(s)
+BOT_TOKEN = ""  # Replace with your bot token
+ADMIN_IDS = []  # Replace with your Telegram user ID(s)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
